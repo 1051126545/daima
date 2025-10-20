@@ -1,0 +1,662 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import geopandas as gpd
+import cartopy.crs as ccrs
+import matplotlib.ticker as mticker
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_validate, StratifiedKFold
+from imblearn.pipeline import Pipeline as imbpipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+from matplotlib.lines import Line2D
+from scipy.interpolate import griddata
+import shap
+import matplotlib
+from imblearn.over_sampling import SMOTE
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
+from shapely.ops import transform  # ✅ 确保这行没有被注释
+import pyproj
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
+from shapely.geometry import Point, Polygon  # 导入所需的几何类型
+from pyproj import Transformer
+# -------------------------------
+# ✅ 统一字体设置：支持中英文的黑体
+# -------------------------------
+matplotlib.use('Agg')  # 必须在 plt 之前
+
+# 设置中文字体为黑体，支持中文和全角符号
+plt.rcParams['font.sans-serif'] = [
+    'SimHei',           # 黑体（Windows）
+    'Microsoft YaHei',  # 微软雅黑（备用）
+    'DejaVu Sans',      # 跨平台备选（支持英文、括号等）
+    'Arial',
+    'sans-serif'
+]
+plt.rcParams['axes.unicode_minus'] = False  # 正确显示负号
+
+# 全局字体大小与样式
+plt.rcParams.update({
+    'font.size': 12,                # 全局字体大小
+    'axes.labelsize': 12,           # 坐标轴标签
+    'xtick.labelsize': 12,          # x轴刻度
+    'ytick.labelsize': 12,          # y轴刻度
+    'legend.fontsize': 12,          # 图例
+    'figure.titlesize': 10,         # 图标题大小
+    'figure.titleweight': 'bold',   # 图标题加粗
+    'savefig.dpi': 300,             # 高清输出
+    'savefig.bbox': 'tight',        # 紧凑边距
+    'figure.figsize': (8, 6),       # 默认图像大小
+    'axes.grid': False              # 关闭网格（可选）
+})
+
+output_img_dir = "G:/years/6month/RESULT/6/ALL"#5.6
+os.makedirs(output_img_dir, exist_ok=True)
+
+file_path = "G:/years/6month/BScentral.xlsx"
+df = pd.read_excel(file_path, sheet_name='Sheet1')#2014-2024
+
+non_feature_cols = ['do', 'time', 'station', 'longitude', 'latitude']
+X = df.drop(columns=non_feature_cols)
+y = df['do'].apply(lambda x: 1 if x <= 4 else 0)  # do <= 4 表示低氧事件
+
+original_feature_names = X.columns.tolist()
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+print("训练集中的类别分布:")
+print(y_train.value_counts())
+
+pipeline = imbpipeline([
+    ('imputer', SimpleImputer(strategy='mean')),  # 缺失值填充
+    ('scaler', StandardScaler()),                 # 标准化
+    ('smote', SMOTE(random_state=42)),            # 使用 imblearn 的 SMOTE
+    ('model', RandomForestClassifier(random_state=42, class_weight='balanced'))
+])
+
+# 参数网格
+param_grid = {
+    'model__max_depth': [5, 7],
+    'model__min_samples_leaf': [2, 5],
+    'model__n_estimators': [200]
+}
+
+# 网格搜索
+grid_search = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring='f1',
+    cv=5,
+    n_jobs=-1,
+    verbose=1
+)
+grid_search.fit(X_train, y_train)
+
+# 最佳模型
+best_pipeline = grid_search.best_estimator_
+print("✅ 最优参数:", grid_search.best_params_)
+
+# 概率预测
+y_score = best_pipeline.predict_proba(X_test)[:, 1]
+y_pred = (y_score >= 0.5).astype(int)  # 默认阈值
+
+# 自动搜索最佳阈值
+thresholds = np.linspace(0.1, 0.5, 20)
+best_threshold = 0.5
+best_f1 = 0
+for t in thresholds:
+    y_pred_t = (y_score >= t).astype(int)
+    f1 = f1_score(y_test, y_pred_t)
+    if f1 > best_f1:
+        best_f1 = f1
+        best_threshold = t
+print(f"\n最佳阈值: {best_threshold:.2f}, 最佳 F1 Score: {best_f1:.4f}")
+
+# 使用最佳阈值预测
+y_pred_best = (y_score >= best_threshold).astype(int)
+
+# 性能评估函数
+def evaluate_model(y_true, y_pred, y_score=None, name="模型"):
+    print(f"\n=== {name} 性能评估 ===")
+    cm = confusion_matrix(y_true, y_pred)
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred)
+    rec = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    if y_score is not None:
+        auc = roc_auc_score(y_true, y_score)
+    else:
+        auc = float('nan')
+    print("confusion matrix:")
+    print(cm)
+    print(f"准确率 Accuracy:  {acc:.4f}")
+    print(f"精确率 Precision: {prec:.4f}")
+    print(f"召回率 Recall:    {rec:.4f}")
+    print(f"F1 Score:        {f1:.4f}")
+    print(f"AUC Score:       {auc:.4f}")
+    fig_path = os.path.join(output_img_dir, f"confusion_matrix_{name}.png")
+    plt.figure(figsize=(6, 4))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
+                xticklabels=['Predicted 0', 'Predicted 1'],
+                yticklabels=['Actual 0', 'Actual 1'])
+    plt.title(f"{name} confusion matrix")
+    #plt.xlabel("预测值")
+    #plt.ylabel("真实值")
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ 混淆矩阵图已保存至: {fig_path}")
+    return {
+        'accuracy': acc,
+        'precision': prec,
+        'recall': rec,
+        'f1': f1,
+        'auc': auc}
+
+# 评估默认阈值和最佳阈值模型
+#results = evaluate_model(y_test, y_pred, y_score, name="默认阈值模型")
+results = evaluate_model(y_test, y_pred, y_score, name="Default threshold model")
+#custom_results = evaluate_model(y_test, y_pred_best, y_score, name=f"最佳阈值({best_threshold:.2f})模型")
+custom_results = evaluate_model(y_test, y_pred_best, y_score, name=f"Best threshold ({best_threshold:.2f}) model")
+# ROC曲线
+fpr, tpr, thresholds_roc = roc_curve(y_test, y_score)
+roc_fig_path = os.path.join(output_img_dir, "roc_curve.png")
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {roc_auc_score(y_test, y_score):.4f})')
+plt.plot([0, 1], [0, 1], 'k--', label='Random Guess')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(roc_fig_path, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✅ ROC曲线图已保存至: {roc_fig_path}")
+
+# 特征重要性
+model = best_pipeline.named_steps['model']
+importances = model.feature_importances_
+feature_names = original_feature_names  # 这是一个 list
+
+# 特征重要性图
+feature_fig_path = os.path.join(output_img_dir, "feature_importance.png")
+pd.Series(importances, index=feature_names).sort_values().plot(kind='barh', figsize=(10, 6))
+plt.title("Feature importance（Random Forest）")
+plt.xlabel("Importance Score")
+plt.ylabel("Feature")
+plt.tight_layout()
+plt.savefig(feature_fig_path, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✅ 特征重要性图已保存至: {feature_fig_path}")
+
+# SHAP 解释分析
+print("\n📊 开始生成 SHAP 解释图...")
+
+# 对测试集进行预处理（仅使用 imputer 和 scaler）
+X_test_processed = best_pipeline.named_steps['imputer'].transform(X_test)
+X_test_processed = best_pipeline.named_steps['scaler'].transform(X_test_processed)
+
+# 创建 DataFrame，使用原始特征名
+X_test_all_features = pd.DataFrame(X_test_processed, columns=original_feature_names)
+
+# 获取模型部分
+model = best_pipeline.named_steps['model']
+
+# 计算 SHAP 值，确保数据与模型输入一致
+explainer = shap.TreeExplainer(model, check_additivity=False)  # 禁用加法性检查
+shap_values = explainer.shap_values(X_test_all_features)
+
+# 1. SHAP 摘要图（Summary Plot）
+shap.summary_plot(shap_values[1], X_test_all_features, show=False)
+plt.savefig(os.path.join(output_img_dir, "shap_summary_plot.png"), dpi=300, bbox_inches='tight')
+plt.close()
+print("✅ SHAP 摘要图已保存")
+
+# 2. 每个特征的依赖图（Dependence Plot）
+for feature_name in original_feature_names:
+    plt.figure(figsize=(8, 6))
+    shap.dependence_plot(feature_name, shap_values[1], X_test_all_features, show=False)
+    plt.savefig(os.path.join(output_img_dir, f"shap_dependence_plot_{feature_name}.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ SHAP 依赖图（{feature_name}）已保存")
+
+y_train_score = best_pipeline.predict_proba(X_train)[:, 1]
+y_train_pred = (y_train_score >= best_threshold).astype(int)
+df_train = X_train.copy()
+df_train['真实标签'] = y_train.values
+df_train['预测概率_训练集'] = y_train_score
+df_train['预测结果_训练集'] = y_train_pred
+print("\n=== 模型在训练集上的性能 ===")
+train_results = evaluate_model(
+    y_train,
+    y_train_pred,
+    y_train_score,
+    name="训练集模型"
+)
+train_output_path = "G:/years/6month/RESULT/6/ALL/训练集预测结果.xlsx"
+df_train.to_excel(train_output_path, index=False)
+print(f"✅ 训练集预测结果已保存至: {train_output_path}")
+scoring = {
+    'accuracy': 'accuracy',
+    'precision': 'precision',
+    'recall': 'recall',
+    'f1': 'f1',
+    'roc_auc': 'roc_auc'
+}
+cv_results = cross_validate(
+    best_pipeline,
+    X_train,  # 使用训练集数据进行交叉验证
+    y_train,
+    cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+    scoring=scoring,
+    return_train_score=False,
+    n_jobs=-1
+)
+print("\n=== 交叉验证结果（训练集） ===")
+for metric in scoring:
+    scores = cv_results[f'test_{metric}']
+    print(f"{metric}: {scores.mean():.4f} ± {scores.std():.4f}")
+    print(f"  每折得分: {scores}")
+test_indices = X_test.index
+unique_sites = df.loc[test_indices, ['station', 'latitude', 'longitude', 'do']].copy()
+unique_sites['真实标签'] = unique_sites['do'].apply(lambda x: 1 if x <= 4 else 0)
+unique_sites['预测结果'] = y_pred_best
+shapefile_path = "G:/years/2017/bou1_4p.shp"
+try:
+    gdf_shape = gpd.read_file(shapefile_path)
+except UnicodeDecodeError:
+    print("⚠️ UTF-8 解码失败，尝试使用 GBK 编码加载 Shapefile")
+    gdf_shape = gpd.read_file(shapefile_path, encoding='gbk')
+import matplotlib.ticker as mticker
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+map_output_png = "G:/years/6month/RESULT/6/ALL/预警地图可视化_with_legend_comparison.png"
+min_lon, max_lon = unique_sites['longitude'].min() - 1, unique_sites['longitude'].max() + 1
+min_lat, max_lat = unique_sites['latitude'].min() - 1, unique_sites['latitude'].max() + 1
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 10), subplot_kw={'projection': ccrs.PlateCarree()})
+ax1, ax2 = axes
+
+def setup_ax(ax):
+    ax.set_extent([min_lon, max_lon, min_lat, max_lat], crs=ccrs.PlateCarree())
+    gdf_shape.plot(ax=ax, color='lightgray', edgecolor='black', linewidth=0.5)
+
+    gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                      linewidth=1, color='gray', alpha=0.5, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlabel_style = {'size': 16, 'color': 'black'}
+    gl.ylabel_style = {'size': 16, 'color': 'black'}
+
+    gl.xformatter = LONGITUDE_FORMATTER
+    gl.yformatter = LATITUDE_FORMATTER
+
+    # 设置每 1 度画一条线，可改为 0.5 或 2 等
+    gl.xlocator = mticker.FixedLocator(np.arange(np.floor(min_lon), np.ceil(max_lon), 1))
+    gl.ylocator = mticker.FixedLocator(np.arange(np.floor(min_lat), np.ceil(max_lat), 1))
+
+legend_elements = [
+    plt.Line2D([0], [0], marker='o', color='w', label='Normal（0）',
+               markerfacecolor='blue', markersize=12),
+    plt.Line2D([0], [0], marker='o', color='w', label='Hypoxia（1）',
+               markerfacecolor='red', markersize=12)
+]
+
+setup_ax(ax1)
+#ax1.set_title("图1: 真实低氧事件分布（真实标签）", fontsize=14)
+ax1.set_title(" Real hypoxia distribution (real label)", fontsize=16)
+for _, row in unique_sites.iterrows():
+    color = 'blue' if row['真实标签'] == 0 else 'red'
+    ax1.plot(row['longitude'], row['latitude'], 'o',
+             color=color, markersize=10, alpha=0.8,
+             transform=ccrs.Geodetic())
+ax1.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(0.02, 0.95), title="Category")#类别
+
+setup_ax(ax2)
+#ax2.set_title("图2: 模型预测低氧事件分布（预测结果）", fontsize=14)
+ax2.set_title(" Model prediction of hypoxia distribution (prediction label）", fontsize=16)
+for _, row in unique_sites.iterrows():
+    color = 'blue' if row['预测结果'] == 0 else 'red'
+    ax2.plot(row['longitude'], row['latitude'], 'o',
+             color=color, markersize=10, alpha=0.8,
+             transform=ccrs.Geodetic())
+
+plt.tight_layout()
+plt.savefig(map_output_png, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"✅ 对比地图已保存至: {map_output_png}")
+plt.close()
+
+new_sheet_name = 'Sheet7'#验证集#12.13.14-2022.2020.2019年无气温，成图的sheet
+df_new = pd.read_excel(file_path, sheet_name=new_sheet_name)
+original_df_new = df_new.copy()
+
+X_new = df_new[feature_names]
+
+if 'do' in df_new.columns:
+    y_new_true = df_new['do'].apply(lambda x: 1 if x <= 4 else 0)
+else:
+    y_new_true = None
+
+y_new_score = best_pipeline.predict_proba(X_new)[:, 1]
+
+best_threshold_sheet7 = 0.5
+best_f1_sheet7 = 0
+thresholds = np.linspace(0.1, 0.9, 50)
+
+if y_new_true is not None:
+    for threshold in thresholds:
+        y_pred_t = (y_new_score >= threshold).astype(int)
+        f1 = f1_score(y_new_true, y_pred_t)
+        if f1 > best_f1_sheet7:
+            best_f1_sheet7 = f1
+            best_threshold_sheet7 = threshold
+    print(f"\n✅ Sheet 最佳阈值: {best_threshold_sheet7:.2f}, 最佳 F1 Score: {best_f1_sheet7:.4f}")
+
+    y_new_pred_sheet7 = (y_new_score >= best_threshold_sheet7).astype(int)
+else:
+    best_threshold_sheet7 = best_threshold
+    y_new_pred_sheet7 = (y_new_score >= best_threshold_sheet7).astype(int)
+
+df_new_output = original_df_new[['station', 'latitude', 'longitude']].copy()
+df_new_output['真实标签'] = y_new_true if y_new_true is not None else np.nan
+df_new_output['预测概率'] = y_new_score
+df_new_output['预测结果'] = y_new_pred_sheet7
+
+output_new_sheet_path = os.path.join(output_img_dir, f"新数据预测结果_{new_sheet_name}.xlsx")
+df_new_output.to_excel(output_new_sheet_path, index=False)
+print(f"\n✅ 新数据预测结果已保存至: {output_new_sheet_path}")
+
+if y_new_true is not None:
+    print(f"\n📊 新数据 ({new_sheet_name}) 上的模型性能评估：")
+
+    custom_results_sheet7 = evaluate_model(
+        y_new_true,
+        y_new_pred_sheet7,
+        y_new_score,
+        name=f"{new_sheet_name} 最佳阈值({best_threshold_sheet7:.2f})模型"
+    )
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from shapely.ops import unary_union
+import geopandas as gpd
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+#from matplotlib.ticker import mticker
+import matplotlib.ticker as ticker
+# 假设 df_new_output 和其他必要的变量已经定义和赋值
+
+if 'latitude' in df_new_output.columns and 'longitude' in df_new_output.columns:
+    # 定义输出路径
+    map_output_new_path = os.path.join(output_img_dir, f"预警地图可视化_{new_sheet_name}.png")
+
+    try:
+        # 加载shapefile
+        gdf_shape = gpd.read_file(shapefile_path)
+    except UnicodeDecodeError:
+        print("⚠️ UTF-8 解码失败，尝试使用 GBK 编码加载 Shapefile")
+        gdf_shape = gpd.read_file(shapefile_path, encoding='gbk')
+
+    # 确保shapefile包含有效的Polygon或多边形几何体
+    if gdf_shape.geom_type.isin(['Polygon', 'MultiPolygon']).all():
+        ocean_polygon = unary_union([geom for geom in gdf_shape.geometry if geom.is_valid])
+    else:
+        raise ValueError("Shapefile must contain Polygon or MultiPolygon geometries for masking.")
+
+    # 自动计算地图的显示范围
+    min_lon, max_lon = df_new_output['longitude'].min() - 0.5, df_new_output['longitude'].max() + 0.5#调整范围
+    min_lat, max_lat = df_new_output['latitude'].min() - 0.5, df_new_output['latitude'].max() + 0.5
+
+    # 创建地图
+    fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
+    ax.set_extent([min_lon, max_lon, min_lat, max_lat], crs=ccrs.PlateCarree())
+
+    # 绘制shapefile
+    gdf_shape.plot(ax=ax, color='lightgray', edgecolor='black', linewidth=0.5)
+
+    # 添加网格线
+    gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                      linewidth=1, color='gray', alpha=0.5, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlabel_style = {'size': 15, 'color': 'black'}
+    gl.ylabel_style = {'size': 15, 'color': 'black'}
+    gl.xformatter = LONGITUDE_FORMATTER
+    gl.yformatter = LATITUDE_FORMATTER
+    gl.xlocator = mticker.FixedLocator(np.arange(np.floor(min_lon), np.ceil(max_lon), 1))
+    gl.ylocator = mticker.FixedLocator(np.arange(np.floor(min_lat), np.ceil(max_lat), 1))
+
+    # 图例设置
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', label='Normal（0）',
+                   markerfacecolor='blue', markersize=12),
+        plt.Line2D([0], [0], marker='o', color='w', label='Hypoxia（1）',
+                   markerfacecolor='red', markersize=12)
+    ]
+
+    # 绘制站点
+    for _, row in df_new_output.iterrows():
+        color = 'blue' if row['预测结果'] == 0 else 'red'
+        ax.plot(row['longitude'], row['latitude'], 'o',
+                color=color, markersize=10, alpha=0.8,
+                transform=ccrs.Geodetic())
+
+    # 添加图例和标题
+    ax.legend(handles=legend_elements, loc='upper right', title="Predictive category")
+    plt.title(f"{new_sheet_name} Visualization of prediction results")
+
+    # 保存图像
+    plt.tight_layout()
+    plt.savefig(map_output_new_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ 地图已保存至: {map_output_new_path}")
+# 3. 精确插值图 + 渤海海域严格掩膜（论文级可视化）—— 最终优化版
+from shapely.geometry import Point
+import xarray as xr
+import rioxarray
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+print("gdf_shape 几何类型:")
+print(gdf_shape.geometry.geom_type.value_counts())
+print("gdf_shape bounds (min_lon, min_lat, max_lon, max_lat):")
+print(gdf_shape.total_bounds)  # [minx, miny, maxx, maxy]
+# 提取坐标与预测概率
+lon = df_new_output['longitude'].values
+lat = df_new_output['latitude'].values
+z = df_new_output['预测概率'].values
+
+min_lon, max_lon = df_new_output['longitude'].min() - 0.2, df_new_output['longitude'].max() + 0.2
+min_lat, max_lat = df_new_output['latitude'].min() - 0.2, df_new_output['latitude'].max() + 0.2
+
+resolution = 500
+grid_lon = np.linspace(min_lon, max_lon, resolution)
+grid_lat = np.linspace(min_lat, max_lat, resolution)
+grid_lon_2d, grid_lat_2d = np.meshgrid(grid_lon, grid_lat)
+
+# 插值
+try:
+    grid_z = griddata(points=np.column_stack((lon, lat)), values=z,
+                      xi=np.column_stack((grid_lon_2d.ravel(), grid_lat_2d.ravel())), method='cubic')
+except Exception as e:
+    print(f"⚠️ cubic 插值失败: {e}，改用 linear")
+    grid_z = griddata(points=np.column_stack((lon, lat)), values=z,
+                      xi=np.column_stack((grid_lon_2d.ravel(), grid_lat_2d.ravel())), method='linear')
+grid_z = grid_z.reshape(grid_lon_2d.shape)
+
+# 转为 xarray 并写 CRS
+da = xr.DataArray(
+    data=grid_z[np.newaxis, :, :],
+    dims=["band", "y", "x"],
+    coords={"band": [1], "y": grid_lat, "x": grid_lon},
+    attrs={
+        "transform": (grid_lon[1] - grid_lon[0], 0, grid_lon[0],
+                      0, grid_lat[1] - grid_lat[0], grid_lat[0]),
+        "crs": "EPSG:4326"
+    }
+)
+da.rio.write_crs("EPSG:4326", inplace=True)
+
+from shapely.ops import unary_union
+import numpy as np
+
+# 构建海洋多边形 - 假设 gdf_shape 包含渤海海域的陆地边界
+polys = [geom for geom in gdf_shape.geometry if geom.is_valid]
+
+# 如果有 MultiPolygon 类型的数据，先将其解包成 Polygon 列表
+polygons = []
+for geom in polys:
+    if geom.geom_type == 'Polygon':
+        polygons.append(geom)
+    elif geom.geom_type == 'MultiPolygon':
+        polygons.extend(geom.geoms)
+
+# 使用 unary_union 合并所有多边形，避免重复点或重叠区域
+ocean_polygon = unary_union(polygons)
+
+try:
+    # 使用 rioxarray 掩膜（仅保留海洋内部）
+    da_masked = da.rio.clip([ocean_polygon], drop=False, invert=True)
+    masked_da = da_masked[0].values  # 提取 numpy 数组，避免坐标问题
+    print("✅ 成功使用 rioxarray 掩膜（去除陆地，保留海洋）")
+except Exception as e:
+    print(f"⚠️ rioxarray 掩膜失败: {e}，使用传统掩膜回退")
+
+    # 创建掩膜：True 表示要 mask（隐藏）
+    mask = np.ones(grid_z.shape, dtype=bool)
+    # 快速采样判断是否在海洋内
+    for i in range(0, grid_lon_2d.shape[0], 5):
+        for j in range(0, grid_lon_2d.shape[1], 5):
+            point = Point(grid_lon_2d[i, j], grid_lat_2d[i, j])
+            if not ocean_polygon.contains(point):  # 不在任何陆地多边形内即为海洋
+                # 标记附近区域为“不掩膜”
+                i_start, i_end = max(0, i-2), min(grid_z.shape[0], i+3)
+                j_start, j_end = max(0, j-2), min(grid_z.shape[1], j+3)
+                mask[i_start:i_end, j_start:j_end] = False
+    # 扩展 mask 到全图
+    mask_full = np.repeat(np.repeat(mask[::5, ::5], 5, axis=0), 5, axis=1)
+    mask_full = mask_full[:grid_z.shape[0], :grid_z.shape[1]]
+    masked_da = np.ma.masked_array(grid_z, mask_full)
+
+# 开始绘图
+# fig, ax = plt.subplots(figsize=(10, 9), subplot_kw={'projection': ccrs.PlateCarree()})
+# ax.set_extent([min_lon, max_lon, min_lat, max_lat], crs=ccrs.PlateCarree())
+# gdf_shape.plot(ax=ax, color='lightgray', edgecolor='black', linewidth=0.8, zorder=1)
+map_output_interpolate_path = os.path.join(output_img_dir, f"预警地图可视化_interpolated_{new_sheet_name}.png")
+fig, ax = plt.subplots(figsize=(10, 9), subplot_kw={'projection': ccrs.PlateCarree()})
+ax.set_extent([min_lon, max_lon, min_lat, max_lat], crs=ccrs.PlateCarree())  # 使用相同的边界来设置地图范围
+gdf_shape.plot(ax=ax, color='lightgray', edgecolor='black', linewidth=0.8, zorder=1)
+# 绘制插值面（仅海洋）
+im = ax.contourf(
+    grid_lon_2d, grid_lat_2d, masked_da,
+    levels=np.linspace(0, 1, 11),
+    cmap='coolwarm', alpha=0.8, transform=ccrs.PlateCarree(), extend='both'
+)
+
+# 绘制等值线（仅海洋）
+ax.contour(
+    grid_lon_2d, grid_lat_2d, masked_da,
+    levels=np.linspace(0, 1, 11),
+    colors='black',
+    linewidths=0.3,
+    linestyles='solid',
+    alpha=0.5,
+    transform=ccrs.PlateCarree()
+)
+
+# 绘制最佳阈值线（绿色虚线）
+CS = ax.contour(
+    grid_lon_2d, grid_lat_2d, masked_da,
+    levels=[best_threshold_sheet7],
+    colors='limegreen',
+    linewidths=2.5,
+    linestyles='dashed',
+    transform=ccrs.PlateCarree()
+)
+ax.clabel(CS, fmt={best_threshold_sheet7: f'{best_threshold_sheet7:.2f}'}, fontsize=10,
+          colors='limegreen', inline=True)
+
+# 叠加采样点
+for _, row in df_new_output.iterrows():
+    color = 'blue' if row['预测结果'] == 0 else 'red'
+    ax.plot(
+        row['longitude'], row['latitude'],
+        marker='o', color=color, markersize=6, alpha=0.9,
+        transform=ccrs.Geodetic(), zorder=5,
+        markeredgecolor='white', markeredgewidth=0.8
+    )
+
+# 标题
+ax.set_title(f"Hypoxia probability prediction map for 2022", fontsize=18, weight='bold', pad=20)#年份
+
+# 网格线
+gl = ax.gridlines(draw_labels=True, linewidth=1.0, color='gray', alpha=0.5, linestyle='--')
+gl.top_labels = False
+gl.right_labels = False
+gl.xlabel_style = {'size': 12}
+gl.ylabel_style = {'size': 12}
+gl.xformatter = LONGITUDE_FORMATTER
+gl.yformatter = LATITUDE_FORMATTER
+gl.xlocator = mticker.FixedLocator(np.arange(np.floor(min_lon), np.ceil(max_lon), 1))
+gl.ylocator = mticker.FixedLocator(np.arange(np.floor(min_lat), np.ceil(max_lat), 1))
+
+# 颜色条
+cbar = plt.colorbar(im, ax=ax, shrink=0.6, pad=0.08, aspect=20)
+cbar.set_label('Hypoxia Probability', fontsize=14)
+cbar.ax.tick_params(labelsize=12)
+
+# 保存
+plt.tight_layout()
+plt.savefig(map_output_interpolate_path, dpi=300, bbox_inches='tight', facecolor='white')
+plt.close()
+print(f"✅ 插值区域地图（仅限渤海海域，等值线不越界）已保存至: {map_output_interpolate_path}")
+
+# === 计算低氧区域面积（km²）===
+print("\n📊 开始计算低氧区域面积...")
+
+# 获取 dx 和 dy，即网格单元在经度和纬度方向上的大小
+dx = np.mean(np.diff(grid_lon))  # 经度方向上的平均差距
+dy = np.mean(np.diff(grid_lat))  # 纬度方向上的平均差距
+
+# 创建包含低氧区域的多边形
+hypoxia_polygons = []
+for i in range(grid_z.shape[0]):
+    for j in range(grid_z.shape[1]):
+        if not np.ma.is_masked(masked_da[i, j]) and masked_da[i, j] >= best_threshold_sheet7:
+            # 获取四个角点的经纬度坐标
+            lon_min = grid_lon_2d[i, j] - dx / 2
+            lon_max = grid_lon_2d[i, j] + dx / 2
+            lat_min = grid_lat_2d[i, j] - dy / 2
+            lat_max = grid_lat_2d[i, j] + dy / 2
+
+            # 创建四边形并添加到列表中
+            hypoxia_polygons.append(Polygon([
+                (lon_min, lat_min), (lon_max, lat_min),
+                (lon_max, lat_max), (lon_min, lat_max)
+            ]))
+
+# 合并所有小多边形
+if len(hypoxia_polygons) > 0:
+    hypoxia_polygon = unary_union(hypoxia_polygons)
+
+    # 将多边形转换为 GeoDataFrame 并设置坐标系
+    gdf_hypoxia = gpd.GeoDataFrame({'geometry': [hypoxia_polygon]}, crs="EPSG:4326")
+
+    # 转换到等面积投影（如 EPSG:6933）
+    gdf_hypoxia_area = gdf_hypoxia.to_crs("EPSG:6933")
+
+    # 计算面积（单位：平方千米）
+    total_hypoxia_area = gdf_hypoxia_area['geometry'].area.iloc[0] / 1e6
+else:
+    total_hypoxia_area = 0.0
+
+total_hypoxia_area = round(total_hypoxia_area, 2)
+print(f"✅ 低氧区域面积（概率 ≥ {best_threshold_sheet7:.2f}）: {total_hypoxia_area} km²")
